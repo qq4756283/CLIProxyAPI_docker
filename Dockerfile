@@ -1,60 +1,61 @@
-FROM eceasy/cli-proxy-api:latest
-LABEL "language"="go"
+# 构建阶段：编译 Go 程序
+FROM golang:1.26-alpine AS builder
 
-# Create necessary directories
-RUN mkdir -p /CLIProxyAPI /root/.cli-proxy-api
+# 配置 Go 代理加速依赖下载
+ENV GOPROXY=https://goproxy.cn,direct
+ENV GO111MODULE=on
 
-# Write the config.yaml file
-RUN cat > /CLIProxyAPI/config.yaml << 'EOF'
-host: ""
-port: 8317
+WORKDIR /app
 
-tls:
-  enable: false
-  cert: ""
-  key: ""
+# 复制依赖文件并下载
+COPY go.mod go.sum ./
+RUN go mod download && go mod verify
 
-remote-management:
-  allow-remote: false
-  secret-key: ""
-  disable-control-panel: false
-  panel-github-repository: "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
+# 复制源码
+COPY . .
 
-auth-dir: "~/.cli-proxy-api"
+# 构建参数（版本/提交/构建时间）
+ARG VERSION=dev
+ARG COMMIT=none
+ARG BUILD_DATE=unknown
 
-api-keys:
-  - "your-api-key-1"
-  - "your-api-key-2"
-  - "your-api-key-3"
+# 编译静态二进制文件
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -ldflags="-s -w -trimpath -X 'main.Version=${VERSION}' -X 'main.Commit=${COMMIT}' -X 'main.BuildDate=${BUILD_DATE}'" \
+    -o ./CLIProxyAPI ./cmd/server/
 
-debug: false
+# 运行阶段：轻量 Alpine 镜像
+FROM alpine:3.22.0
 
-pprof:
-  enable: false
-  addr: "127.0.0.1:8316"
+# 安装依赖：tzdata（时区）、curl（拉取配置文件）、yq（可选：环境变量覆盖配置）
+RUN apk add --no-cache tzdata curl yq
 
-commercial-mode: false
-logging-to-file: false
-logs-max-total-size-mb: 0
-error-logs-max-files: 10
-usage-statistics-enabled: false
-proxy-url: ""
-force-model-prefix: false
-passthrough-headers: false
-request-retry: 3
-max-retry-credentials: 0
-max-retry-interval: 30
+# 创建非 root 用户（Zeabur 安全最佳实践）
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 
-quota-exceeded:
-  switch-project: true
-  switch-preview-model: true
+# 创建应用目录并设置权限
+RUN mkdir -p /CLIProxyAPI \
+    && chown -R appuser:appgroup /CLIProxyAPI
 
-routing:
-  strategy: "round-robin"
+# 从构建阶段复制编译好的二进制文件
+COPY --from=builder /app/CLIProxyAPI /CLIProxyAPI/CLIProxyAPI
 
-ws-auth: false
-nonstream-keepalive-interval: 0
-EOF
+# 关键：直接从指定 URL 拉取配置文件（兜底机制：拉取失败则创建空配置，避免启动崩溃）
+RUN curl -fSL "https://raw.githubusercontent.com/router-for-me/CLIProxyAPI/refs/heads/main/config.example.yaml" -o /CLIProxyAPI/config.yaml \
+    || (echo "拉取配置文件失败，创建默认空配置" && echo "server:\n  port: 8317" > /CLIProxyAPI/config.yaml)
 
+# 设置时区（Asia/Shanghai）
+ENV TZ=Asia/Shanghai
+RUN cp /usr/share/zoneinfo/${TZ} /etc/localtime && echo "${TZ}" > /etc/timezone
+
+# 暴露端口（Zeabur 自动识别）
 EXPOSE 8317
-CMD ["eceasy/cli-proxy-api"]
+
+# 切换到非 root 用户
+USER appuser
+
+# 工作目录
+WORKDIR /CLIProxyAPI
+
+# 启动命令（直接启动程序，配置文件已提前准备好）
+CMD ["./CLIProxyAPI"]
